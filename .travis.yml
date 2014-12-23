@@ -1,0 +1,6 @@
+language: go
+install: make race
+go:
+  - 1.2
+  - 1.3
+  - 1.4
