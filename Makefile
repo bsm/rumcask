@@ -8,3 +8,6 @@ test: deps
 
 race: deps
 	go test -v -race ./...
+
+bench: deps
+	go test -test.run=NONE -test.bench=.

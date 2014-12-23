@@ -1,7 +1,13 @@
 package rumcask
 
 import (
+	"bytes"
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"os"
 	"path/filepath"
+	"testing"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -122,3 +128,66 @@ var _ = Describe("DB", func() {
 	})
 
 })
+
+func BenchmarkDB_Writes_64(b *testing.B) { benchDB_writes(b, 64) }
+func BenchmarkDB_Writes_1K(b *testing.B) { benchDB_writes(b, 1*KiB) }
+func BenchmarkDB_Writes_1M(b *testing.B) { benchDB_writes(b, 1*MiB) }
+func BenchmarkDB_Reads_64(b *testing.B)  { benchDB_reads(b, 64) }
+func BenchmarkDB_Reads_1K(b *testing.B)  { benchDB_reads(b, 1*KiB) }
+func BenchmarkDB_Reads_1M(b *testing.B)  { benchDB_reads(b, 1*MiB) }
+
+func benchDB_run(b *testing.B, call func(*DB) error) {
+	dir, err := ioutil.TempDir("", "rumcask-bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	db, err := Open(dir, NewHashKeyStore())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	b.ResetTimer()
+	if err := call(db); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func benchDB_reads(b *testing.B, size int) {
+	value := bytes.Repeat([]byte{'X'}, size)
+	benchDB_run(b, func(db *DB) error {
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("KEY%08d", i)
+			if _, err := db.Set([]byte(key), value); err != nil {
+				return err
+			}
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("KEY%08d", rand.Intn(b.N))
+			if _, err := db.Get([]byte(key)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+}
+
+func benchDB_writes(b *testing.B, size int) {
+	value := bytes.Repeat([]byte{'X'}, size)
+	benchDB_run(b, func(db *DB) error {
+		for i := 0; i < b.N; i++ {
+			key := fmt.Sprintf("KEY%08d", rand.Intn(b.N))
+			_, err := db.Set([]byte(key), value)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+}
