@@ -84,9 +84,22 @@ var _ = Describe("DB", func() {
 		}))
 	})
 
+	It("should validate arguments", func() {
+		_, err := subject.Set([]byte(""), []byte("val1"))
+		Expect(err).To(Equal(ERROR_KEY_BLANK))
+		_, err = subject.Set(nil, []byte("val1"))
+		Expect(err).To(Equal(ERROR_KEY_BLANK))
+		_, err = subject.Set([]byte("key1"), nil)
+		Expect(err).To(Equal(ERROR_VALUE_BLANK))
+		_, err = subject.Set([]byte("key1"), []byte{})
+		Expect(err).To(Equal(ERROR_VALUE_BLANK))
+		_, err = subject.Set(bytes.Repeat([]byte{'k'}, MAX_KEY_LEN+1), []byte("val1"))
+		Expect(err).To(Equal(ERROR_KEY_TOO_LONG))
+	})
+
 	It("should get records", func() {
 		_, err := subject.Get([]byte("key1"))
-		Expect(err).To(Equal(NOT_FOUND))
+		Expect(err).To(Equal(ERROR_NOT_FOUND))
 
 		fill()
 		val, err := subject.Get([]byte("key1"))
@@ -99,21 +112,47 @@ var _ = Describe("DB", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(val).To(Equal([]byte("val3")))
 		_, err = subject.Get([]byte("key9"))
-		Expect(err).To(Equal(NOT_FOUND))
+		Expect(err).To(Equal(ERROR_NOT_FOUND))
+	})
+
+	It("should delete records", func() {
+		ok, err := subject.Delete([]byte("key3"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeFalse())
+
+		fill()
+		Expect(subject.current.offset).To(Equal(uint32(176)))
+
+		ok, err = subject.Delete([]byte("key3"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+
+		Expect(subject.pages).To(HaveLen(2))
+		Expect(subject.pages[0].header.Stats).To(Equal(PageStats{3, 2}))
+		Expect(subject.pages[1].header.Stats).To(Equal(PageStats{3, 0}))
+		Expect(keys.refs).To(Equal(map[string]PageRef{
+			"key1": {ID: 0, Offset: 128},
+			"key2": {ID: 1, Offset: 144},
+			"key4": {ID: 1, Offset: 128},
+			"key5": {ID: 1, Offset: 160},
+		}))
+
+		_, err = subject.Get([]byte("key3"))
+		Expect(err).To(Equal(ERROR_NOT_FOUND))
 	})
 
 	It("should reopen DBs", func() {
 		fill()
 		Expect(subject.pages).To(HaveLen(2))
-
-		err := subject.Close()
+		_, err := subject.Delete([]byte("key3"))
 		Expect(err).NotTo(HaveOccurred())
+		Expect(subject.Close()).NotTo(HaveOccurred())
 
 		subject, err = Open(testDir, keys)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(subject.pages).To(HaveLen(2))
-		Expect(subject.pages[0].header.Stats).To(Equal(PageStats{3, 1}))
+		Expect(subject.pages[0].header.Stats).To(Equal(PageStats{3, 2}))
 		Expect(subject.pages[1].header.Stats).To(Equal(PageStats{3, 0}))
 
 		Expect(subject.current).NotTo(BeNil())
@@ -121,7 +160,6 @@ var _ = Describe("DB", func() {
 		Expect(keys.refs).To(Equal(map[string]PageRef{
 			"key1": {ID: 0, Offset: 128},
 			"key2": {ID: 1, Offset: 144},
-			"key3": {ID: 0, Offset: 160},
 			"key4": {ID: 1, Offset: 128},
 			"key5": {ID: 1, Offset: 160},
 		}))

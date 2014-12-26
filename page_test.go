@@ -114,8 +114,8 @@ var _ = Describe("Page", func() {
 
 	It("should open new files and write a header", func() {
 		Expect(subject.id).To(Equal(uint32(23)))
-		Expect(subject.offset).To(Equal(uint32(PAGE_HEADER_LEN)))
-		Expect(subject.pos()).To(Equal(uint32(PAGE_HEADER_LEN)))
+		Expect(subject.offset).To(Equal(uint32(128)))
+		Expect(subject.pos()).To(Equal(uint32(128)))
 	})
 
 	It("should reject invalid file names", func() {
@@ -124,11 +124,12 @@ var _ = Describe("Page", func() {
 	})
 
 	It("should reopen files", func() {
-		_, err := subject.append([]byte("key1"), []byte("some data"))
+		off1, err := subject.write([]byte("key1"), []byte("some data"))
 		Expect(err).NotTo(HaveOccurred())
-		off, err := subject.append([]byte("key2"), []byte("more data"))
+		Expect(off1).To(Equal(uint32(128)))
+		off2, err := subject.write([]byte("key2"), []byte("more data"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(off).To(Equal(uint32(149)))
+		Expect(off2).To(Equal(uint32(149)))
 		subject.deleted()
 		Expect(subject.header.Stats).To(Equal(PageStats{2, 1}))
 		Expect(subject.close()).NotTo(HaveOccurred())
@@ -148,23 +149,23 @@ var _ = Describe("Page", func() {
 		Expect(err).To(Equal(ERROR_PAGE_BAD_HEADER))
 	})
 
-	It("should append/read data", func() {
+	It("should write/read data", func() {
 		Expect(subject.pos()).To(Equal(uint32(PAGE_HEADER_LEN)))
 
-		off, err := subject.append([]byte("key1"), []byte("data"))
+		off1, err := subject.write([]byte("key1"), []byte("data"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(off).To(Equal(uint32(PAGE_HEADER_LEN)))
+		Expect(off1).To(Equal(uint32(128)))
 		Expect(subject.pos()).To(Equal(uint32(144)))
 
-		off, err = subject.append([]byte("key2"), []byte("more data"))
-		Expect(off).To(Equal(uint32(144)))
+		off2, err := subject.write([]byte("key2"), []byte("more data"))
+		Expect(off2).To(Equal(uint32(144)))
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(subject.pos()).To(Equal(uint32(165)))
 		Expect(subject.header.Stats).To(Equal(PageStats{2, 0}))
 
 		raw := make([]byte, 16)
-		_, err = subject.file.ReadAt(raw, 128)
+		_, err = subject.file.ReadAt(raw, int64(off1))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(raw).To(Equal([]byte{
 			4, 0, // key length = 4
@@ -174,56 +175,94 @@ var _ = Describe("Page", func() {
 			9, 189, // CRC-16
 		}))
 
-		key, value, err := subject.read(PAGE_HEADER_LEN)
+		key, value, deleted, err := subject.read(PAGE_HEADER_LEN)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(deleted).To(BeFalse())
 		Expect(string(key)).To(Equal("key1"))
 		Expect(string(value)).To(Equal("data"))
 
-		key, value, err = subject.read(144)
+		key, value, deleted, err = subject.read(144)
 		Expect(err).NotTo(HaveOccurred())
+		Expect(deleted).To(BeFalse())
 		Expect(string(key)).To(Equal("key2"))
 		Expect(string(value)).To(Equal("more data"))
 	})
 
 	It("should read known keys", func() {
-		_, err := subject.append([]byte("key1"), []byte("data"))
+		off1, err := subject.write([]byte("key1"), []byte("data"))
 		Expect(err).NotTo(HaveOccurred())
 
-		_, err = subject.append([]byte("key2"), []byte("more data"))
+		off2, err := subject.write([]byte("key2"), []byte("more data"))
 		Expect(err).NotTo(HaveOccurred())
 
-		value, err := subject.readKey([]byte("key2"), 144)
+		val1, err := subject.readKey([]byte("key1"), off1)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(value)).To(Equal("more data"))
+		Expect(string(val1)).To(Equal("data"))
+
+		val2, err := subject.readKey([]byte("key2"), off2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(val2)).To(Equal("more data"))
 
 		_, err = subject.readKey([]byte("key1"), 144)
-		Expect(err).To(Equal(ERROR_INVALID_CHECKSUM))
+		Expect(err).To(Equal(ERROR_BAD_CHECKSUM))
 
 		_, err = subject.readKey([]byte("key2"), 138)
-		Expect(err).To(Equal(ERROR_INVALID_OFFSET))
+		Expect(err).To(Equal(ERROR_BAD_OFFSET))
+	})
+
+	It("should mark records as deleted", func() {
+		off1, err := subject.write([]byte("key1"), []byte("data"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(subject.delete(off1)).NotTo(HaveOccurred())
+		Expect(subject.header.Stats).To(Equal(PageStats{1, 1}))
+
+		raw := make([]byte, 6)
+		_, err = subject.file.ReadAt(raw, int64(off1))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(raw).To(Equal([]byte{
+			4, 0, // key len
+			4, 0, 0, 128, // value len, with last bit ticked
+		}))
+
+		key, val, deleted, err := subject.read(off1)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deleted).To(BeTrue())
+		Expect(key).To(Equal([]byte("key1")))
+		Expect(val).To(Equal([]byte("data")))
+	})
+
+	It("should not delete twice", func() {
+		off1, err := subject.write([]byte("key1"), []byte("data"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(subject.delete(off1)).NotTo(HaveOccurred())
+		Expect(subject.header.Stats).To(Equal(PageStats{1, 1}))
+
+		Expect(subject.delete(off1)).NotTo(HaveOccurred())
+		Expect(subject.header.Stats).To(Equal(PageStats{1, 1}))
 	})
 
 	It("should catch read/write errors", func() {
-		_, _, err := subject.read(PAGE_HEADER_LEN)
+		_, _, _, err := subject.read(PAGE_HEADER_LEN)
 		Expect(err).To(Equal(io.EOF))
 
-		_, err = subject.append([]byte("key1"), []byte("data"))
+		_, err = subject.write([]byte("key1"), []byte("data"))
 		Expect(err).NotTo(HaveOccurred())
 
-		_, _, err = subject.read(131)
-		Expect(err).To(Equal(ERROR_INVALID_OFFSET))
-
 		subject.file.WriteAt([]byte{'x'}, 138) // replace 'character'
-		_, _, err = subject.read(PAGE_HEADER_LEN)
-		Expect(err).To(Equal(ERROR_INVALID_CHECKSUM))
+		_, _, _, err = subject.read(PAGE_HEADER_LEN)
+		Expect(err).To(Equal(ERROR_BAD_CHECKSUM))
 	})
 
 	It("should parse pages", func() {
-		_, err := subject.append([]byte("key1"), []byte("data"))
+		_, err := subject.write([]byte("key1"), []byte("data"))
 		Expect(err).NotTo(HaveOccurred())
-		_, err = subject.append([]byte("key2"), []byte("more data"))
+		_, err = subject.write([]byte("key2"), []byte("more data"))
 		Expect(err).NotTo(HaveOccurred())
-		_, err = subject.append([]byte("key3"), []byte("even more data"))
+		off3, err := subject.write([]byte("key3"), []byte("doh!"))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = subject.write([]byte("key4"), []byte("even more data"))
+		Expect(err).NotTo(HaveOccurred())
+		err = subject.delete(off3)
 		Expect(err).NotTo(HaveOccurred())
 
 		kstore := NewHashKeyStore()
@@ -231,11 +270,11 @@ var _ = Describe("Page", func() {
 		Expect(kstore.refs).To(Equal(map[string]PageRef{
 			"key1": {23, 128},
 			"key2": {23, 144},
-			"key3": {23, 165},
+			"key4": {23, 181},
 		}))
 	})
 
-	It("should delete entries", func() {
+	It("should allow to increment deletion stats", func() {
 		subject.deleted()
 		Expect(subject.header.Stats).To(Equal(PageStats{0, 1}))
 	})

@@ -22,7 +22,7 @@ const (
 	// Maximum key length: 511 bytes
 	MAX_KEY_LEN = 511
 	// Maximum value length: 64M
-	MAX_VALUE_LEN = 64 * MiB
+	MAX_VALUE_LEN = 64*MiB - 1
 	// Page header length
 	PAGE_HEADER_LEN = 128
 )

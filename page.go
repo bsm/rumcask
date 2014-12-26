@@ -79,6 +79,38 @@ func (h *pageHeader) writeStats(w io.WriterAt) error {
 func (h *pageHeader) recWritten() { atomic.AddUint32(&h.Stats.Written, 1) }
 func (h *pageHeader) recDeleted() { atomic.AddUint32(&h.Stats.Deleted, 1) }
 
+// Helper to iterate page entries
+type pageIterator struct {
+	page        *Page
+	pos, offset uint32
+	err         error
+	key, value  []byte
+	deleted     bool
+}
+
+func newPageIterator(p *Page) *pageIterator {
+	return &pageIterator{page: p, pos: uint32(PAGE_HEADER_LEN)}
+}
+func (i *pageIterator) First()      { i.Next() }
+func (i *pageIterator) Valid() bool { return i.err == nil }
+func (i *pageIterator) Next() {
+	deleted := false
+	i.offset = i.pos
+	i.key, i.value, deleted, i.err = i.page.read(i.pos)
+	if i.Valid() {
+		i.pos += uint32(len(i.key)+len(i.value)) + OH_FULL
+	}
+	if deleted {
+		i.Next()
+	}
+}
+func (i *pageIterator) Error() error {
+	if i.err == io.EOF {
+		return nil
+	}
+	return i.err
+}
+
 // PageRef identifies the page file and an offset position
 type PageRef struct {
 	ID     uint32
@@ -156,7 +188,7 @@ func (p *Page) readKey(key []byte, offset uint32) ([]byte, error) {
 
 	vlen := int(binLE.Uint32(blen))
 	if vlen > MAX_VALUE_LEN {
-		return nil, ERROR_INVALID_OFFSET
+		return nil, ERROR_BAD_OFFSET
 	}
 
 	rest := make([]byte, vlen+OH_CSUM)
@@ -166,52 +198,49 @@ func (p *Page) readKey(key []byte, offset uint32) ([]byte, error) {
 
 	val, csum := rest[:vlen], rest[vlen:]
 	if CRC16(append(key, val...)) != binLE.Uint16(csum) {
-		return nil, ERROR_INVALID_CHECKSUM
+		return nil, ERROR_BAD_CHECKSUM
 	}
 	return val, nil
 
 }
 
 // reads data from the file
-func (p *Page) read(offset uint32) ([]byte, []byte, error) {
+func (p *Page) read(offset uint32) ([]byte, []byte, bool, error) {
 	lens := make([]byte, OH_KV)
 	if _, err := p.file.ReadAt(lens, int64(offset)); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
+
+	// Return if marked as deleted (last bit is set)
+	deleted := lens[OH_KV-1] > 127
+	lens[OH_KV-1] &= 0x7f
 
 	klen := int(binLE.Uint16(lens[0:]))
 	if klen > MAX_KEY_LEN {
-		return nil, nil, ERROR_INVALID_OFFSET
+		return nil, nil, deleted, ERROR_BAD_OFFSET
 	}
 	vlen := int(binLE.Uint32(lens[OH_KEY:]))
 	if vlen > MAX_VALUE_LEN {
-		return nil, nil, ERROR_INVALID_OFFSET
+		return nil, nil, deleted, ERROR_BAD_OFFSET
 	}
 
 	rest := make([]byte, int(klen+vlen+OH_CSUM))
 	if _, err := p.file.ReadAt(rest, int64(offset+OH_KV)); err != nil {
-		return nil, nil, err
+		return nil, nil, deleted, err
 	}
 
 	pair, csum := rest[:klen+vlen], rest[klen+vlen:]
 	if CRC16(pair) != binLE.Uint16(csum) {
-		return nil, nil, ERROR_INVALID_CHECKSUM
+		return nil, nil, deleted, ERROR_BAD_CHECKSUM
 	}
-	return pair[:klen], pair[klen:], nil
+	return pair[:klen], pair[klen:], deleted, nil
 }
 
-// appends a key/value to the file
-func (p *Page) append(key, value []byte) (uint32, error) {
+// writes a key/value to the file
+func (p *Page) write(key, value []byte) (uint32, error) {
 	klen, vlen := len(key), len(value)
-
-	if klen > MAX_KEY_LEN {
-		return 0, ERROR_KEY_TOO_LONG
-	} else if vlen > MAX_VALUE_LEN {
-		return 0, ERROR_VALUE_TOO_LONG
-	}
-
 	kvlen := klen + vlen
-	data := make([]byte, 8+kvlen)
+	data := make([]byte, OH_FULL+kvlen)
 	binLE.PutUint16(data[0:], uint16(klen))
 	binLE.PutUint32(data[OH_KEY:], uint32(vlen))
 	copy(data[OH_KV:], key)
@@ -228,7 +257,34 @@ func (p *Page) append(key, value []byte) (uint32, error) {
 	return offset, nil
 }
 
-// increment delete stats
+// Marks a record as deleted
+func (p *Page) delete(offset uint32) error {
+	if p == nil {
+		return nil
+	}
+
+	// Determine marker position
+	mpos := int64(offset) + OH_KV - 1
+	mbuf := make([]byte, 1)
+	if _, err := p.file.ReadAt(mbuf, mpos); err != nil {
+		return err
+	}
+
+	// Return if already deleted
+	if mbuf[0] > 127 {
+		return nil
+	}
+
+	// Set first bit, write back
+	mbuf[0] |= 0x80
+	if _, err := p.file.WriteAt(mbuf, mpos); err != nil {
+		return err
+	}
+	p.header.recDeleted()
+	return nil
+}
+
+// Callback after a record has been updated or deleted
 func (p *Page) deleted() {
 	if p != nil {
 		p.header.recDeleted()
@@ -236,40 +292,33 @@ func (p *Page) deleted() {
 }
 
 // Parse page, merge keys
-func (p *Page) parse(store KeyStore) (err error) {
-	var key, val []byte
-	pos := uint32(PAGE_HEADER_LEN)
-	for err == nil {
-		if key, val, err = p.read(pos); err == nil {
-			store.Store(key, PageRef{p.id, pos})
-			pos += uint32(len(key)+len(val)) + OH_FULL
-		}
+func (p *Page) parse(store KeyStore) error {
+	iter := newPageIterator(p)
+	for iter.First(); iter.Valid(); iter.Next() {
+		store.Store(iter.key, PageRef{p.id, iter.offset})
 	}
-	if err == io.EOF {
-		err = nil
-	}
-	return
+	return iter.Error()
 }
 
-// returns true if there is not enough space
+// Returns true if there is not enough space
 // to write the next key/value
 func (p *Page) canWrite(kvlen int) bool {
-	return p.pos()+uint32(kvlen)+8 < MAX_PAGE_SIZE
+	return p.pos()+uint32(kvlen)+OH_FULL < MAX_PAGE_SIZE
 }
 
-// returns current position (atomic)
+// Returns current position (atomic)
 func (p *Page) pos() uint32 {
 	return atomic.LoadUint32(&p.offset)
 }
 
-// unlinks the page completely
+// Unlinks the page completely
 func (p *Page) unlink() error {
 	fname := p.file.Name()
 	p.close()
 	return os.Remove(fname)
 }
 
-// close closes the file
+// Closes the file
 func (p *Page) close() error {
 	select {
 	case _, open := <-p.closer:
@@ -284,7 +333,7 @@ func (p *Page) close() error {
 	return p.file.Close()
 }
 
-// stats persistence loop
+// Persistence loop
 func (p *Page) loop() {
 	defer func() {
 		p.header.writeStats(p.file)

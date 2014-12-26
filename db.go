@@ -50,12 +50,12 @@ func Open(dir string, keys KeyStore) (*DB, error) {
 func (db *DB) Get(key []byte) ([]byte, error) {
 	ref, ok := db.keys.Fetch(key)
 	if !ok {
-		return nil, NOT_FOUND
+		return nil, ERROR_NOT_FOUND
 	}
 
 	page := db.page(ref.ID)
 	if page == nil {
-		return nil, NOT_FOUND
+		return nil, ERROR_NOT_FOUND
 	}
 
 	return page.readKey(key, ref.Offset)
@@ -64,16 +64,21 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 // Set sets a key, value pair. Returns true if key was replaced,
 // or false if the key is new
 func (db *DB) Set(key, value []byte) (bool, error) {
+	klen, vlen := len(key), len(value)
+	if klen < 1 {
+		return false, ERROR_KEY_BLANK
+	} else if klen > MAX_KEY_LEN {
+		return false, ERROR_KEY_TOO_LONG
+	} else if vlen < 1 {
+		return false, ERROR_VALUE_BLANK
+	} else if vlen > MAX_VALUE_LEN {
+		return false, ERROR_VALUE_TOO_LONG
+	}
+
 	db.cLock.Lock()
 	defer db.cLock.Unlock()
 
-	if !db.current.canWrite(len(key) + len(value)) {
-		if err := db.nextPage(); err != nil {
-			return false, err
-		}
-	}
-
-	offset, err := db.current.append(key, value)
+	offset, err := db.write(key, value)
 	if err != nil {
 		return false, err
 	}
@@ -83,6 +88,25 @@ func (db *DB) Set(key, value []byte) (bool, error) {
 		db.page(pref.ID).deleted()
 	}
 	return ok, nil
+}
+
+// Delete deletes a key. Returns true if key was found,
+// or false if the key was not stored in the first place
+func (db *DB) Delete(key []byte) (bool, error) {
+	db.cLock.Lock()
+	defer db.cLock.Unlock()
+
+	// Try to remove key, return if not stored
+	pref, ok := db.keys.Delete(key)
+	if !ok {
+		return ok, nil
+	}
+
+	page, ok := db.pages[pref.ID]
+	if !ok {
+		return ok, nil
+	}
+	return ok, page.delete(pref.Offset)
 }
 
 // Close closes the database again
@@ -95,6 +119,16 @@ func (db *DB) Close() (err error) {
 		}
 	}
 	return
+}
+
+// Writes a key/value pair, rotates the current page if needed
+func (db *DB) write(key, value []byte) (uint32, error) {
+	if !db.current.canWrite(len(key) + len(value)) {
+		if err := db.nextPage(); err != nil {
+			return 0, err
+		}
+	}
+	return db.current.write(key, value)
 }
 
 // Gets the page by ID
